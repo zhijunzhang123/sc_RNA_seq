@@ -1,0 +1,276 @@
+---
+title: "10_scRNAseq"
+author: "HC"
+date: "2024-12-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(cowplot)
+```
+
+```{r}
+#devtools::install_github('satijalab/seurat-data')
+```
+
+# 读取多个样本保存在一个列表里面
+
+```{r}
+# 载入需要的包
+library(Seurat)
+library(cowplot)
+
+# 获取数据路径
+# 获取10X格式数据的子文件夹名称
+matrix_list <- list.dirs(".", recursive = FALSE)
+
+# 初始化一个空向量，用于存储后续处理得到的Seurat对象
+Subset_Cells.list <- vector("list", length(matrix_list))  # 用列表更适合存储对象
+
+# 批量处理10X数据
+for (index in seq_along(matrix_list)) {
+    # 获取当前子文件夹路径
+    matrix_path <- matrix_list[index]
+
+    # 读取10X Genomics格式的数据
+    # 假设每个子文件夹中有barcodes.tsv, genes.tsv/features.tsv, 和matrix.mtx文件
+    object.data <- Read10X(data.dir = matrix_path)
+
+    # 创建Seurat对象，用于后续分析
+    object <- CreateSeuratObject(counts = object.data, 
+                                 project = basename(matrix_path),  # 使用文件夹名称作为项目名称
+                                 min.cells = 3, 
+                                 min.features = 200)
+
+    # 计算线粒体基因的百分比
+    # 使用正则模式“^mt-”匹配线粒体基因
+    object[["percent.mt"]] <- PercentageFeatureSet(object, pattern = "^MT-")
+
+    # 处理特殊情况：如果数据中没有线粒体基因
+    if (sum(object@meta.data$percent.mt) == 0) {
+        object@meta.data$percent.mt[1] <- 0.000001
+    }
+
+    # 将处理后的Seurat对象存入列表
+    Subset_Cells.list[[index]] <- object
+}
+
+# 可选：为列表命名，便于后续操作
+names(Subset_Cells.list) <- basename(matrix_list)
+
+# 提示完成
+print("所有10X Genomics数据处理完成！")
+```
+
+# 多个数据创建为1个Seurat对象
+
+```{r}
+# 将 `Subset_Cells.list` 的第一个元素与其余元素合并，创建一个包含所有细胞的单一 Seurat 对象。
+# 参数解析：
+# 1. `Subset_Cells.list[[1]]`: `Subset_Cells.list` 的第一个元素，作为初始 Seurat 对象。
+# 2. `y = Subset_Cells.list[-1]`: 提供其余的 Seurat 对象（除了第一个）作为待合并的列表。
+# 3. `add.cell.ids = names(Subset_Cells.list)`: 为每个 Seurat 对象中的细胞添加前缀（以原始列表的名称命名）。
+# 4. `project = "neuron"`: 指定合并后的 Seurat 对象的项目名称为 "neuron"。
+object.combined <- merge(
+  Subset_Cells.list[[1]], 
+  y = Subset_Cells.list[-1], 
+  add.cell.ids = names(Subset_Cells.list), 
+  project = "neuron"
+)
+
+str(object.combined)
+
+save(object.combined, file = "object_combined.RData")
+```
+
+# 不整合分析
+
+```{r}
+load("object_combined.RData")
+# 将原始合并的 Seurat 对象 `object.combined` 复制为 `raw_combined_object`。
+# 命名为 `raw_combined_object` 表明此对象是在批次效应校正之前的数据处理对象。
+raw_combined_object <- object.combined 
+
+# 对 `raw_combined_object` 进行归一化处理：
+# 将基因表达值标准化为每个细胞的比例，适应后续分析。
+raw_combined_object <- NormalizeData(raw_combined_object)
+
+# 查找高变异基因：
+# 筛选出在细胞间变异性较高的基因，用于后续降维和聚类分析。
+raw_combined_object <- FindVariableFeatures(raw_combined_object)
+
+# 对数据进行标准化处理：
+# 通过中心化和缩放消除基因表达值的差异，确保后续分析不受原始数据范围的影响。
+raw_combined_object <- ScaleData(raw_combined_object)
+
+# 进行主成分分析 (PCA)：
+# 使用高变异基因进行线性降维分析，以提取数据中的主要表达模式。
+raw_combined_object <- RunPCA(raw_combined_object)
+```
+
+```{r}
+# 基于 PCA 结果构建邻近图（FindNeighbors）：
+# 参数：
+# - `raw_combined_object`: 输入的 Seurat 对象，包含 PCA 降维结果。
+# - `dims = 1:30`: 使用 PCA 的前 30 个主成分进行邻居搜索。
+# - `reduction = "pca"`: 指定使用 PCA 作为降维方法。
+# 作用：
+# FindNeighbors 使用降维空间中的距离计算每个细胞的最近邻，从而为后续聚类（FindClusters）建立图形结构。
+raw_combined_object <- FindNeighbors(raw_combined_object, dims = 1:30, reduction = "pca")
+
+# 基于邻居图进行聚类（FindClusters）：
+# 参数：
+# - `resolution = 2`: 控制聚类的粒度，较高的值会产生更多、更小的聚类。
+# - `cluster.name = "unintegrated_clusters"`: 自定义聚类名称，标识为“未整合的聚类”。
+# 作用：
+# FindClusters 利用邻居图进行社区检测，将细胞分配到不同的聚类。
+raw_combined_object <- FindClusters(raw_combined_object, resolution = 2, cluster.name = "unintegrated_clusters")
+```
+
+```{r}
+# 使用 UMAP 降维方法对 `raw_combined_object` 进行二维可视化：
+# 参数：
+# - dims = 1:30: 使用前 30 个 PCA 主成分作为输入。
+# - reduction = "pca": 指定 UMAP 的输入数据来源于 PCA。
+# - reduction.name = "umap.unintegrated": 将生成的 UMAP 坐标存储为名为 "umap.unintegrated" 的降维结果。
+# 作用：生成未去除批次效应的 UMAP 坐标。
+raw_combined_object <- RunUMAP(
+  raw_combined_object, 
+  dims = 1:30, 
+  reduction = "pca", 
+  reduction.name = "umap.unintegrated"
+)
+```
+
+```{r}
+# 将可视化 UMAP 图保存为 PDF 文件：
+# - 使用未整合的 UMAP 坐标进行绘图。
+# - 分组方式为 `orig.ident` 和 `seurat_clusters`。
+# - 将图像保存为 "UMAP_unintegrated.pdf"。
+pdf("UMAP_unintegrated.pdf", width = 15, height = 6)  # 打开 PDF 输出设备
+DimPlot(
+  raw_combined_object, 
+  reduction = "umap.unintegrated", 
+  group.by = c("orig.ident", "seurat_clusters")
+)
+dev.off()  # 关闭 PDF 输出设备
+```
+
+ # 整合去除批次效应
+
+```{r}
+load("object_combined.RData")
+# 将 `object.combined` 赋值给 `integrated_object`，作为后续批次效应整合后的对象。
+# 这一步确保数据保持一致，便于后续分析。
+integrated_object <- object.combined
+
+# 对 `integrated_object` 进行数据归一化处理：
+# 将基因表达数据进行归一化，使其每个细胞的基因表达在相同的尺度上，适应后续分析。
+integrated_object <- NormalizeData(integrated_object)
+
+# 查找高变异基因：
+# 使用 `FindVariableFeatures` 来识别在细胞间具有较大变异的基因，这些基因对下游分析（如降维和聚类）具有较大贡献。
+integrated_object <- FindVariableFeatures(integrated_object)
+
+# 对数据进行标准化处理：
+# 使用 `ScaleData` 对基因表达数据进行标准化（去中心化和缩放），确保每个基因的均值为 0，方差为 1，从而消除不同基因的尺度差异。
+integrated_object <- ScaleData(integrated_object)
+
+# 对 `integrated_object` 进行主成分分析（PCA）：
+# PCA 是一种常用的降维方法，通过保留最重要的主成分来减少数据维度。
+# 这有助于揭示数据中潜在的结构，并且为后续分析（如聚类和可视化）提供基础。
+integrated_object <- RunPCA(integrated_object)
+```
+
+```{r}
+# 使用 CCA（典型相关分析）方法进行数据整合，这一步是 Seurat v5 特有的：
+# CCA 用于结合不同数据集的信息，去除批次效应，整合多个数据集。
+# 参数：
+# - object = integrated_object: 输入的 Seurat 对象，包含需要整合的数据。
+# - method = CCAIntegration: 指定使用 CCA 进行整合。
+# - orig.reduction = "pca": 使用 PCA 降维结果作为输入数据进行整合。
+# - new.reduction = "integrated.cca": 整合后新的降维结果命名为 "integrated.cca"。
+# - verbose = FALSE: 设置为 FALSE，禁止输出详细的运行信息。
+# 作用：通过 CCA 方法整合数据，去除批次效应，并生成一个新的降维结果 "integrated.cca"。
+integrated_object <- IntegrateLayers(
+  object = integrated_object, 
+  method = CCAIntegration, 
+  orig.reduction = "pca", 
+  new.reduction = "integrated.cca", 
+  verbose = FALSE
+)
+```
+
+```{r}
+# 使用 JoinLayers() 函数将矩阵融合，这一步是 Seurat v5 特有的：
+# 该步骤用于将多个数据矩阵（如不同批次或不同实验条件下的 counts 矩阵）融合为一个统一的矩阵。
+# 通过 `JoinLayers`，可以将不同的数据层（例如多个实验或不同条件下的 counts）整合到同一个层次中，方便后续分析。
+# 这里的融合操作将原本存储在 integrated_object@assays$RNA@layers 中的 counts.mouse_neuron_1(2/3/4/5) 融合成一个统一的 counts 矩阵。
+
+# 参数：
+# integrated_object[["RNA"]]：指定要操作的 Seurat 对象中的 RNA 数据（assay）。
+# JoinLayers()：该函数会将 RNA assay 中不同的 counts 数据层融合为一个层，创建一个统一的 counts 矩阵。
+
+integrated_object[["RNA"]] <- JoinLayers(integrated_object[["RNA"]])
+```
+
+```{r}
+# 聚类、分群
+# 使用"integrated.cca"方法（前期的合并结果）来计算细胞之间的邻近关系
+# reduction 参数指定了使用的降维方法（"integrated.cca"），dims 参数指定了使用的前30个主成分（PCA的前30个维度）
+integrated_object <- FindNeighbors(integrated_object, reduction = "integrated.cca", dims = 1:30)
+
+# 基于计算的邻近关系进行聚类分析
+# resolution 参数控制聚类的粒度，值越大，聚类越细致。这里设置为0.5，表示较为粗略的聚类
+integrated_object <- FindClusters(integrated_object, resolution = 0.5)
+```
+
+```{r}
+# UMAP降维
+# 使用UMAP算法对数据进行降维，通常用于可视化高维数据
+# dims 参数指定了用于降维的主成分范围（这里是前30个主成分），
+# reduction 参数指定了使用的降维方法（"integrated.cca"表示合并后的降维结果）
+integrated_object <- RunUMAP(integrated_object, dims = 1:30, reduction = "integrated.cca")
+```
+
+```{r}
+# 画图展示整合效果
+# 将结果输出到PDF文件中，指定文件名和图形尺寸
+pdf("Dimplot_group_Normal_CCA.pdf", width = 20, height = 10)
+
+# 第一个UMAP图，按照原始样本（orig.ident）进行分组展示
+# group.by 参数指定按照哪个元数据进行分组，pt.size 调整点的大小
+p1 <- DimPlot(integrated_object, reduction = "umap", group.by = "orig.ident", pt.size = 1.0)
+
+# 第二个UMAP图，显示每个群集的标签（label = TRUE）
+# pt.size 调整点的大小
+p2 <- DimPlot(integrated_object, reduction = "umap", label = TRUE, pt.size = 1.0)
+
+# 将两个UMAP图合并显示
+p1 + p2
+
+# 关闭图形设备，保存PDF文件
+dev.off()
+```
+
+```{r}
+# 将分割的UMAP图保存为PDF文件
+# 输出文件名为"Dimplot_split_Normal_CCA.pdf"，并指定图形的宽度和高度
+pdf("Dimplot_split_Normal_CCA.pdf", width = 50, height = 10)
+
+# 绘制UMAP图，按原始样本（orig.ident）进行分割展示
+# split.by 参数用于根据指定的元数据进行数据分割（这里按"orig.ident"分割）
+# ncol 参数设置每行显示的图像数量，pt.size 调整点的大小
+DimPlot(integrated_object, reduction = "umap", split.by = "orig.ident", ncol = 5, pt.size = 1.0)
+
+# 关闭图形设备，保存并完成PDF文件的生成
+dev.off()
+```
+
+```{r}
+# 存储结果
+# 将整合后的对象保存为RDS文件，方便以后加载和使用
+saveRDS(integrated_object, file = "integration_Normal_CCA.rds")
+```
